@@ -1,0 +1,304 @@
+import cv2
+import numpy as np
+import os
+import pytesseract
+
+
+def load_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    return img
+
+
+def correct_orientation(img):
+    """
+    Detects if the page is rotated 90/180/270 degrees (e.g. phone held
+    sideways or upside-down) and rotates it back to upright/portrait,
+    BEFORE crop_to_page / deskew run. This is separate from deskew_image,
+    which only corrects small tilt (a few degrees), not gross rotation.
+    """
+    try:
+        osd = pytesseract.image_to_osd(img)
+        angle = int([line for line in osd.split("\n") if "Rotate" in line][0].split(":")[-1].strip())
+    except Exception as e:
+        print(f"  OSD failed ({e}), falling back to aspect-ratio heuristic")
+        h, w = img.shape[:2]
+        angle = 90 if w > h else 0  # answer sheets are usually portrait
+
+    if angle == 90:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif angle == 180:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+    elif angle == 270:
+        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    print(f"  Detected rotation: {angle} degrees -> corrected")
+    return img
+
+
+def crop_to_page(img):
+    orig = img.copy()
+    ratio = img.shape[0] / 500.0
+    small = cv2.resize(img, (int(img.shape[1] / ratio), 500))
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 150)
+    edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    page_contour = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > 0.2 * small.shape[0] * small.shape[1]:
+            page_contour = approx
+            break
+
+    if page_contour is None:
+        return orig
+
+    pts = (page_contour.reshape(4, 2) * ratio).astype(np.float32)
+
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]
+    ordered[2] = pts[np.argmax(s)]
+    ordered[1] = pts[np.argmin(diff)]
+    ordered[3] = pts[np.argmax(diff)]
+
+    (tl, tr, br, bl) = ordered
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
+    return warped
+
+
+def resize_image(img, width=1200, height=1600):
+    return cv2.resize(img, (width, height))
+
+
+def convert_to_gray(img):
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def denoise_image(gray_img):
+    return cv2.GaussianBlur(gray_img, (5, 5), 0)
+
+
+def deskew_image(gray_img):
+    thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return gray_img
+
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    (h, w) = gray_img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(
+        gray_img, M, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def binarize_image(gray_img):
+    return cv2.adaptiveThreshold(
+        gray_img, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=25,
+        C=15
+    )
+
+
+def remove_ruled_lines(binary_img):
+    inverted = cv2.bitwise_not(binary_img)
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    horizontal_lines = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, h_kernel, iterations=2)
+
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    vertical_lines = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, v_kernel, iterations=2)
+
+    ruled_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
+    cleaned = cv2.bitwise_and(inverted, cv2.bitwise_not(ruled_lines))
+    return cv2.bitwise_not(cleaned)
+
+
+def detect_ruled_line_positions(binary_img, line_width_frac=0.3, min_gap=5):
+    inverted = cv2.bitwise_not(binary_img)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (200, 1))
+    horizontal_lines = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, h_kernel, iterations=1)
+
+    row_density = np.sum(horizontal_lines > 0, axis=1)
+    threshold = line_width_frac * binary_img.shape[1]
+    ruled_rows = np.where(row_density > threshold)[0]
+
+    if len(ruled_rows) == 0:
+        return []
+
+    groups = []
+    start = ruled_rows[0]
+    prev = ruled_rows[0]
+    for r in ruled_rows[1:]:
+        if r - prev > min_gap:
+            groups.append((start + prev) // 2)
+            start = r
+        prev = r
+    groups.append((start + prev) // 2)
+    return groups
+
+
+def build_line_grid(ruled_positions, img_height, top_margin=0):
+    if len(ruled_positions) < 2:
+        return []
+
+    diffs = np.diff(sorted(ruled_positions))
+    spacing = np.median(diffs)
+
+    first = min(ruled_positions)
+    n_up = int(first // spacing) + 1
+    grid_start = first - n_up * spacing
+
+    grid = []
+    y = grid_start
+    while y < img_height:
+        grid.append(y)
+        y += spacing
+
+    bands = []
+    for i in range(len(grid) - 1):
+        y0 = max(0, int(grid[i]))
+        y1 = min(img_height, int(grid[i + 1]))
+        if y1 > y0:
+            bands.append((y0, y1))
+    return bands
+
+
+def find_line_contours(binary_img, min_line_height=10):
+    inverted = cv2.bitwise_not(binary_img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 7))
+    dilated = cv2.dilate(inverted, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    img_h, img_w = binary_img.shape[:2]
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > 0.9 * img_w and h > 0.9 * img_h:
+            continue
+        if h >= min_line_height:
+            boxes.append((x, y, w, h))
+
+    boxes.sort(key=lambda b: b[1])
+    return boxes
+
+
+def crop_lines(binary_img, boxes, pad=5):
+    h_img, w_img = binary_img.shape[:2]
+    line_images = []
+    for (x, y, w, h) in boxes:
+        y0 = max(0, y - pad)
+        y1 = min(h_img, y + h + pad)
+        x0 = max(0, x - pad)
+        x1 = min(w_img, x + w + pad)
+        line_images.append(binary_img[y0:y1, x0:x1])
+    return line_images
+
+
+def run_pipeline(image_path, output_dir="output"):
+    debug_dir = os.path.join(output_dir, "debug")
+    lines_dir = os.path.join(output_dir, "lines")
+    os.makedirs(debug_dir, exist_ok=True)
+    os.makedirs(lines_dir, exist_ok=True)
+
+    print(f"Loading: {image_path}")
+    img = load_image(image_path)
+
+    print("Correcting orientation...")
+    img = correct_orientation(img)
+    cv2.imwrite(os.path.join(debug_dir, "0a_orientation_corrected.png"), img)
+
+    print("Detecting page boundary and cropping...")
+    page = crop_to_page(img)
+    cv2.imwrite(os.path.join(debug_dir, "0_page_crop.png"), page)
+
+    print("Resizing...")
+    resized = resize_image(page)
+    cv2.imwrite(os.path.join(debug_dir, "1_resized.png"), resized)
+
+    print("Converting to grayscale...")
+    gray = convert_to_gray(resized)
+    cv2.imwrite(os.path.join(debug_dir, "2_gray.png"), gray)
+
+    print("Denoising...")
+    denoised = denoise_image(gray)
+    cv2.imwrite(os.path.join(debug_dir, "3_denoised.png"), denoised)
+
+    print("Deskewing...")
+    deskewed = deskew_image(denoised)
+    cv2.imwrite(os.path.join(debug_dir, "4_deskewed.png"), deskewed)
+
+    print("Binarizing...")
+    binary = binarize_image(deskewed)
+    cv2.imwrite(os.path.join(debug_dir, "5_binary.png"), binary)
+
+    print("Removing ruled lines (margin + ruling)...")
+    cleaned = remove_ruled_lines(binary)
+    cv2.imwrite(os.path.join(debug_dir, "5b_lines_removed.png"), cleaned)
+
+    print("Detecting ruled-line grid...")
+    ruled_positions = detect_ruled_line_positions(binary)
+    bands = build_line_grid(ruled_positions, binary.shape[0])
+
+    if len(bands) >= 3:
+        print(f"  -> Using ruled-line grid: {len(bands)} line(s)")
+        boxes = [(0, y0, binary.shape[1], y1 - y0) for (y0, y1) in bands]
+    else:
+        print("  -> No ruling detected, falling back to contour detection...")
+        boxes = find_line_contours(cleaned)
+    print(f"  -> Found {len(boxes)} line(s)")
+
+    annotated = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    for (x, y, w, h) in boxes:
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
+    cv2.imwrite(os.path.join(debug_dir, "6_lines_annotated.png"), annotated)
+
+    print("Cropping lines...")
+    line_images = crop_lines(cleaned, boxes)
+    for i, line_img in enumerate(line_images):
+        cv2.imwrite(os.path.join(lines_dir, f"line_{i:03d}.png"), line_img)
+
+    print(f"\nDone. Check '{debug_dir}/' for each stage and '{lines_dir}/' for cropped lines.")
+    return line_images
+
+
+if __name__ == "__main__":
+    image_path = "q1.jpeg"
+    run_pipeline(image_path)
